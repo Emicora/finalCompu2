@@ -3,6 +3,9 @@ import argparse
 import json
 from tasks import process_notification  # Importamos la tarea de Celery
 
+# Lista de eventos predefinidos
+VALID_EVENTS = {"Natacion", "Pilates", "Yoga", "Boxeo", "Tenis"}
+
 # Diccionario para almacenar las suscripciones: { "evento": [writer1, writer2, ...], ... }
 subscriptions = {}
 
@@ -10,8 +13,16 @@ async def handle_client(reader, writer):
     addr = writer.get_extra_info('peername')
     print(f"Conexión establecida con {addr}")
 
-    while True:
-        try:
+    # Enviar la lista de eventos disponibles al cliente al conectarse
+    welcome_msg = {
+        "message": "Bienvenido. Estos son los eventos disponibles:",
+        "events": list(VALID_EVENTS)
+    }
+    writer.write((json.dumps(welcome_msg) + "\n").encode())
+    await writer.drain()
+
+    try:
+        while True:
             data = await reader.readline()
             if not data:
                 break  # El cliente cerró la conexión
@@ -28,6 +39,11 @@ async def handle_client(reader, writer):
             if msg.get("action") == "subscribe":
                 event = msg.get("event")
                 if event:
+                    # Validar que el evento esté en la lista predefinida
+                    if event not in VALID_EVENTS:
+                        writer.write(f"El evento '{event}' no es válido. Eventos permitidos: {', '.join(VALID_EVENTS)}\n".encode())
+                        await writer.drain()
+                        continue
                     subscriptions.setdefault(event, []).append(writer)
                     print(f"{addr} se suscribió al evento '{event}'")
                     writer.write(f"Suscripción al evento '{event}' exitosa.\n".encode())
@@ -38,20 +54,17 @@ async def handle_client(reader, writer):
             else:
                 writer.write("Acción desconocida.\n".encode())
                 await writer.drain()
+    except Exception as e:
+        print(f"Error al manejar a {addr}: {e}")
+    finally:
+        print(f"Cerrando conexión con {addr}")
+        writer.close()
+        await writer.wait_closed()
 
-        except Exception as e:
-            print(f"Error al manejar a {addr}: {e}")
-            break
-
-    print(f"Cerrando conexión con {addr}")
-    writer.close()
-    await writer.wait_closed()
-
-async def console_handler():
+async def console_handler(shutdown_event):
     """Lee comandos desde la consola del servidor y envía notificaciones."""
     loop = asyncio.get_event_loop()
-    while True:
-        # run_in_executor evita bloquear el loop principal con input()
+    while not shutdown_event.is_set():
         command = await loop.run_in_executor(None, input, ">> ")
         if command.startswith("send"):
             parts = command.split(" ", 2)
@@ -60,20 +73,19 @@ async def console_handler():
                 continue
             event = parts[1]
             message = parts[2]
-            # Llamamos a la tarea de Celery para procesar la notificación
             print("Procesando notificación mediante Celery...")
             try:
-                # Se utiliza run_in_executor para no bloquear el loop al esperar el resultado
-                result = await loop.run_in_executor(None, lambda: process_notification.delay(event, message).get(timeout=10))
+                result = await loop.run_in_executor(
+                    None, lambda: process_notification.delay(event, message).get(timeout=10)
+                )
                 print("Resultado del procesamiento:", result)
             except Exception as e:
                 print("Error en el procesamiento distribuido:", e)
                 continue
 
-            # Envío de notificación a clientes suscritos
             if event in subscriptions:
                 for writer in subscriptions[event]:
-                    writer.write((f"Notificación: {message}\n").encode())
+                    writer.write((f"Notificación de {event}: {message}\n").encode())
                     try:
                         await writer.drain()
                     except Exception as e:
@@ -83,7 +95,8 @@ async def console_handler():
                 print(f"No hay suscriptores para el evento '{event}'")
         elif command.strip() == "exit":
             print("Saliendo del servidor...")
-            # Aquí se podría implementar un cierre ordenado de conexiones y del servidor
+            shutdown_event.set()
+            # Cerrar conexiones de clientes
             for event, writers in subscriptions.items():
                 for writer in writers:
                     writer.close()
@@ -92,15 +105,27 @@ async def console_handler():
             print("Comando no reconocido. Usa 'send <evento> <mensaje>' o 'exit'.")
 
 async def main(host, port):
+    shutdown_event = asyncio.Event()
     server = await asyncio.start_server(handle_client, host, port)
     addr = server.sockets[0].getsockname()
     print(f"Servidor corriendo en {addr}")
 
-    # Iniciar el handler de comandos de consola en una tarea concurrente
-    asyncio.create_task(console_handler())
+    # Crear tareas para el servidor y el handler de consola
+    console_task = asyncio.create_task(console_handler(shutdown_event))
+    server_task = asyncio.create_task(server.serve_forever())
 
-    async with server:
-        await server.serve_forever()
+    # Esperar hasta que se active shutdown_event
+    await shutdown_event.wait()
+
+    # Cancelar la tarea del servidor de forma ordenada
+    server_task.cancel()
+    try:
+        await server_task
+    except asyncio.CancelledError:
+        print("Servidor cerrado correctamente.")
+
+    # Esperar a que finalice la tarea de la consola
+    await console_task
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Servidor de Notificaciones en Vivo")
