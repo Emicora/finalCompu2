@@ -21,7 +21,7 @@ async def handle_client(reader, writer):
     print(f"Conexión establecida con {addr}")
     active_clients.add(writer)
 
-    # Enviar mensaje de bienvenida, lista de eventos y prompt de registro
+    # Enviar mensaje de bienvenida, lista de eventos
     welcome_msg = {
         "message": "Bienvenido. Estos son los eventos disponibles:",
         "events": list(VALID_EVENTS)
@@ -61,7 +61,6 @@ async def handle_client(reader, writer):
             writer.write("Debes registrarte primero. Usa: {\"action\": \"register\", \"email\": \"tu_email\"}\n".encode())
             await writer.drain()
 
-    # Si no se registró, se cierra la conexión.
     if not client_email:
         writer.close()
         await writer.wait_closed()
@@ -74,7 +73,6 @@ async def handle_client(reader, writer):
             data = await reader.readline()
             if not data:
                 break  # El cliente cerró la conexión
-
             try:
                 msg = json.loads(data.decode().strip())
             except json.JSONDecodeError:
@@ -93,6 +91,14 @@ async def handle_client(reader, writer):
                     writer.write(f"El evento '{event}' no es válido. Eventos permitidos: {', '.join(VALID_EVENTS)}\n".encode())
                     await writer.drain()
                     continue
+
+                # Verificar si ya está suscrito al evento
+                current_subs = subscriptions.get(event, [])
+                if any(subscriber["email"] == client_email for subscriber in current_subs):
+                    writer.write(f"Ya estás suscrito al evento '{event}'.\n".encode())
+                    await writer.drain()
+                    continue
+
                 subscriber = {"writer": writer, "email": client_email}
                 subscriptions.setdefault(event, []).append(subscriber)
                 print(f"{addr} se suscribió al evento '{event}' con email: {client_email}")
@@ -157,7 +163,6 @@ async def console_handler(shutdown_event):
         elif command.strip() == "exit":
             print("Saliendo del servidor...")
             shutdown_event.set()
-            # Cerrar todas las conexiones activas
             for writer in list(active_clients):
                 writer.close()
                 try:
