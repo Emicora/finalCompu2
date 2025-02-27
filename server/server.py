@@ -10,11 +10,18 @@ VALID_EVENTS = {"Natacion", "Pilates", "Yoga", "Boxeo", "Tenis"}
 # { "evento": [ {"writer": writer, "email": email}, ... ], ... }
 subscriptions = {}
 
+# Conjunto global para rastrear emails registrados entre clientes conectados
+registered_emails = set()
+
+# Conjunto global para rastrear todas las conexiones activas
+active_clients = set()
+
 async def handle_client(reader, writer):
     addr = writer.get_extra_info('peername')
     print(f"Conexión establecida con {addr}")
+    active_clients.add(writer)
 
-    # Enviar la lista de eventos disponibles al cliente al conectarse
+    # Enviar mensaje de bienvenida, lista de eventos y prompt de registro
     welcome_msg = {
         "message": "Bienvenido. Estos son los eventos disponibles:",
         "events": list(VALID_EVENTS)
@@ -22,42 +29,75 @@ async def handle_client(reader, writer):
     writer.write((json.dumps(welcome_msg) + "\n").encode())
     await writer.drain()
 
+    client_email = None
+    # Bucle para gestionar el registro de email
+    while True:
+        data = await reader.readline()
+        if not data:
+            break  # El cliente cerró la conexión
+        try:
+            msg = json.loads(data.decode().strip())
+        except json.JSONDecodeError:
+            writer.write("Mensaje inválido. Se esperaba formato JSON.\n".encode())
+            await writer.drain()
+            continue
+
+        if msg.get("action") == "register":
+            email = msg.get("email")
+            if not email:
+                writer.write("No se proporcionó email. Intenta de nuevo.\n".encode())
+                await writer.drain()
+                continue
+            if email in registered_emails:
+                writer.write(f"El email '{email}' ya está en uso. Por favor, ingresa otro email.\n".encode())
+                await writer.drain()
+            else:
+                registered_emails.add(email)
+                client_email = email
+                writer.write(f"Registro exitoso con el email '{email}'.\n".encode())
+                await writer.drain()
+                break
+        else:
+            writer.write("Debes registrarte primero. Usa: {\"action\": \"register\", \"email\": \"tu_email\"}\n".encode())
+            await writer.drain()
+
+    # Si no se registró, se cierra la conexión.
+    if not client_email:
+        writer.close()
+        await writer.wait_closed()
+        active_clients.discard(writer)
+        return
+
+    # Procesar solicitudes de suscripción y otras acciones
     try:
         while True:
             data = await reader.readline()
             if not data:
                 break  # El cliente cerró la conexión
 
-            message = data.decode().strip()
             try:
-                msg = json.loads(message)
+                msg = json.loads(data.decode().strip())
             except json.JSONDecodeError:
                 writer.write("Mensaje inválido. Se esperaba formato JSON.\n".encode())
                 await writer.drain()
                 continue
 
-            # Se espera el formato: 
-            # {"action": "subscribe", "event": "nombre_evento", "email": "usuario@example.com"}
+            # Se espera el formato: {"action": "subscribe", "event": "nombre_evento"}
             if msg.get("action") == "subscribe":
                 event = msg.get("event")
-                email = msg.get("email")  # Se puede enviar opcionalmente
-                if event:
-                    # Validar que el evento esté en la lista predefinida
-                    if event not in VALID_EVENTS:
-                        writer.write(
-                            f"El evento '{event}' no es válido. Eventos permitidos: {', '.join(VALID_EVENTS)}\n".encode()
-                        )
-                        await writer.drain()
-                        continue
-                    # Guardamos el writer y el email (o None si no se envió)
-                    subscriber = {"writer": writer, "email": email}
-                    subscriptions.setdefault(event, []).append(subscriber)
-                    print(f"{addr} se suscribió al evento '{event}' con email: {email}")
-                    writer.write(f"Suscripción al evento '{event}' exitosa.\n".encode())
-                    await writer.drain()
-                else:
+                if not event:
                     writer.write("No se especificó el nombre del evento.\n".encode())
                     await writer.drain()
+                    continue
+                if event not in VALID_EVENTS:
+                    writer.write(f"El evento '{event}' no es válido. Eventos permitidos: {', '.join(VALID_EVENTS)}\n".encode())
+                    await writer.drain()
+                    continue
+                subscriber = {"writer": writer, "email": client_email}
+                subscriptions.setdefault(event, []).append(subscriber)
+                print(f"{addr} se suscribió al evento '{event}' con email: {client_email}")
+                writer.write(f"Suscripción al evento '{event}' exitosa.\n".encode())
+                await writer.drain()
             else:
                 writer.write("Acción desconocida.\n".encode())
                 await writer.drain()
@@ -66,7 +106,13 @@ async def handle_client(reader, writer):
     finally:
         print(f"Cerrando conexión con {addr}")
         writer.close()
-        await writer.wait_closed()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        active_clients.discard(writer)
+        if client_email in registered_emails:
+            registered_emails.remove(client_email)
 
 async def console_handler(shutdown_event):
     """Lee comandos desde la consola del servidor y envía notificaciones."""
@@ -90,17 +136,13 @@ async def console_handler(shutdown_event):
                 print("Error en el procesamiento distribuido:", e)
                 continue
 
-            # Envío de notificación vía socket y por email a los suscriptores
             if event in subscriptions:
                 for subscriber in subscriptions[event]:
-                    # Enviar notificación vía socket
                     subscriber["writer"].write((f"Notificación de {event}: {message}\n").encode())
                     try:
                         await subscriber["writer"].drain()
                     except Exception as e:
                         print(f"Error al enviar a un suscriptor vía socket: {e}")
-
-                    # Enviar email si se proporcionó
                     if subscriber["email"]:
                         try:
                             email_result = await loop.run_in_executor(
@@ -115,10 +157,13 @@ async def console_handler(shutdown_event):
         elif command.strip() == "exit":
             print("Saliendo del servidor...")
             shutdown_event.set()
-            # Cerrar conexiones de clientes
-            for event, subscribers in subscriptions.items():
-                for subscriber in subscribers:
-                    subscriber["writer"].close()
+            # Cerrar todas las conexiones activas
+            for writer in list(active_clients):
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
             break
         else:
             print("Comando no reconocido. Usa 'send <evento> <mensaje>' o 'exit'.")
