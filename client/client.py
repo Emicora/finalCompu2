@@ -3,9 +3,12 @@ import argparse
 import json
 
 async def interactive_client(host, port):
-    # Se establece la conexión al servidor
-    reader, writer = await asyncio.open_connection(host, port)
     loop = asyncio.get_event_loop()
+    # Pedir al usuario su email al inicio
+    email = await loop.run_in_executor(None, input, "Ingresa tu email: ")
+
+    # Conectarse al servidor
+    reader, writer = await asyncio.open_connection(host, port)
     print("Conectado al servidor.")
     print("Usa el comando: subscribe <nombre_evento> para suscribirte a un evento.")
     print("Escribe 'exit' para cerrar el cliente.")
@@ -19,21 +22,20 @@ async def interactive_client(host, port):
                 break
             print("Mensaje del servidor:", data.decode().strip())
 
-    # Inicia la tarea que escucha los mensajes del servidor
+    # Iniciar la tarea para escuchar mensajes del servidor
     asyncio.create_task(listen_server())
 
-    # Bucle principal para leer comandos del usuario
+    # Bucle para leer comandos del usuario
     while True:
         command = await loop.run_in_executor(None, input, ">> ")
         if command.startswith("subscribe"):
-            # Se espera el formato: subscribe <nombre_evento>
             parts = command.split(" ", 1)
             if len(parts) < 2:
                 print("Uso: subscribe <nombre_evento>")
                 continue
             event = parts[1].strip()
-            # Se crea el mensaje JSON para suscribirse
-            msg = {"action": "subscribe", "event": event}
+            # Enviar el JSON de suscripción con email incluido
+            msg = {"action": "subscribe", "event": event, "email": email}
             writer.write((json.dumps(msg) + "\n").encode())
             await writer.drain()
         elif command.strip() == "exit":

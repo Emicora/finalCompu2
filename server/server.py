@@ -1,12 +1,13 @@
 import asyncio
 import argparse
 import json
-from tasks import process_notification  # Importamos la tarea de Celery
+from tasks import process_notification, send_email_notification  # Importamos tareas de Celery
 
 # Lista de eventos predefinidos
 VALID_EVENTS = {"Natacion", "Pilates", "Yoga", "Boxeo", "Tenis"}
 
-# Diccionario para almacenar las suscripciones: { "evento": [writer1, writer2, ...], ... }
+# Diccionario para almacenar las suscripciones:
+# { "evento": [ {"writer": writer, "email": email}, ... ], ... }
 subscriptions = {}
 
 async def handle_client(reader, writer):
@@ -35,17 +36,23 @@ async def handle_client(reader, writer):
                 await writer.drain()
                 continue
 
-            # Se espera el formato: {"action": "subscribe", "event": "nombre_evento"}
+            # Se espera el formato: 
+            # {"action": "subscribe", "event": "nombre_evento", "email": "usuario@example.com"}
             if msg.get("action") == "subscribe":
                 event = msg.get("event")
+                email = msg.get("email")  # Se puede enviar opcionalmente
                 if event:
                     # Validar que el evento esté en la lista predefinida
                     if event not in VALID_EVENTS:
-                        writer.write(f"El evento '{event}' no es válido. Eventos permitidos: {', '.join(VALID_EVENTS)}\n".encode())
+                        writer.write(
+                            f"El evento '{event}' no es válido. Eventos permitidos: {', '.join(VALID_EVENTS)}\n".encode()
+                        )
                         await writer.drain()
                         continue
-                    subscriptions.setdefault(event, []).append(writer)
-                    print(f"{addr} se suscribió al evento '{event}'")
+                    # Guardamos el writer y el email (o None si no se envió)
+                    subscriber = {"writer": writer, "email": email}
+                    subscriptions.setdefault(event, []).append(subscriber)
+                    print(f"{addr} se suscribió al evento '{event}' con email: {email}")
                     writer.write(f"Suscripción al evento '{event}' exitosa.\n".encode())
                     await writer.drain()
                 else:
@@ -83,13 +90,25 @@ async def console_handler(shutdown_event):
                 print("Error en el procesamiento distribuido:", e)
                 continue
 
+            # Envío de notificación vía socket y por email a los suscriptores
             if event in subscriptions:
-                for writer in subscriptions[event]:
-                    writer.write((f"Notificación de {event}: {message}\n").encode())
+                for subscriber in subscriptions[event]:
+                    # Enviar notificación vía socket
+                    subscriber["writer"].write((f"Notificación de {event}: {message}\n").encode())
                     try:
-                        await writer.drain()
+                        await subscriber["writer"].drain()
                     except Exception as e:
-                        print(f"Error al enviar a un suscriptor: {e}")
+                        print(f"Error al enviar a un suscriptor vía socket: {e}")
+
+                    # Enviar email si se proporcionó
+                    if subscriber["email"]:
+                        try:
+                            email_result = await loop.run_in_executor(
+                                None, lambda: send_email_notification.delay(subscriber["email"], event, message).get(timeout=15)
+                            )
+                            print(f"Email enviado a {subscriber['email']}: {email_result}")
+                        except Exception as e:
+                            print(f"Error al enviar email a {subscriber['email']}: {e}")
                 print(f"Notificación enviada a los suscriptores del evento '{event}'")
             else:
                 print(f"No hay suscriptores para el evento '{event}'")
@@ -97,9 +116,9 @@ async def console_handler(shutdown_event):
             print("Saliendo del servidor...")
             shutdown_event.set()
             # Cerrar conexiones de clientes
-            for event, writers in subscriptions.items():
-                for writer in writers:
-                    writer.close()
+            for event, subscribers in subscriptions.items():
+                for subscriber in subscribers:
+                    subscriber["writer"].close()
             break
         else:
             print("Comando no reconocido. Usa 'send <evento> <mensaje>' o 'exit'.")
@@ -110,21 +129,17 @@ async def main(host, port):
     addr = server.sockets[0].getsockname()
     print(f"Servidor corriendo en {addr}")
 
-    # Crear tareas para el servidor y el handler de consola
     console_task = asyncio.create_task(console_handler(shutdown_event))
     server_task = asyncio.create_task(server.serve_forever())
 
-    # Esperar hasta que se active shutdown_event
     await shutdown_event.wait()
 
-    # Cancelar la tarea del servidor de forma ordenada
     server_task.cancel()
     try:
         await server_task
     except asyncio.CancelledError:
         print("Servidor cerrado correctamente.")
 
-    # Esperar a que finalice la tarea de la consola
     await console_task
 
 if __name__ == "__main__":
