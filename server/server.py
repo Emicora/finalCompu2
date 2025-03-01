@@ -1,6 +1,9 @@
 import asyncio
 import argparse
 import json
+import sqlite3
+import multiprocessing
+import time
 from tasks import process_notification, send_email_notification  # Importamos tareas de Celery
 
 # Lista de eventos predefinidos
@@ -15,6 +18,40 @@ registered_emails = set()
 
 # Conjunto global para rastrear todas las conexiones activas
 active_clients = set()
+
+# Cola de mensajes para registrar suscripciones en la base de datos
+subscription_queue = multiprocessing.Queue()
+
+
+def subscription_worker(queue):
+    """
+    Worker que consume mensajes de suscripción de la cola e inserta los registros en una base de datos SQLite.
+    """
+    conn = sqlite3.connect("subscriptions.db")
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            event TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    while True:
+        item = queue.get()
+        if item == "STOP":
+            break
+        email = item.get("email")
+        event = item.get("event")
+        try:
+            c.execute("INSERT INTO subscriptions (email, event) VALUES (?, ?)", (email, event))
+            conn.commit()
+            print(f"[DB] Suscripción registrada: {email} -> {event}")
+        except Exception as e:
+            print(f"[DB] Error al insertar suscripción: {e}")
+    conn.close()
+
 
 async def handle_client(reader, writer):
     addr = writer.get_extra_info('peername')
@@ -61,6 +98,7 @@ async def handle_client(reader, writer):
             writer.write("Debes registrarte primero. Usa: {\"action\": \"register\", \"email\": \"tu_email\"}\n".encode())
             await writer.drain()
 
+    # Si no se registró, se cierra la conexión.
     if not client_email:
         writer.close()
         await writer.wait_closed()
@@ -99,11 +137,15 @@ async def handle_client(reader, writer):
                     await writer.drain()
                     continue
 
+                # Registrar la suscripción en memoria para notificaciones en tiempo real
                 subscriber = {"writer": writer, "email": client_email}
                 subscriptions.setdefault(event, []).append(subscriber)
-                print(f"{addr} se suscribió al evento '{event}' con email: {client_email}")
                 writer.write(f"Suscripción al evento '{event}' exitosa.\n".encode())
                 await writer.drain()
+                print(f"{addr} se suscribió al evento '{event}' con email: {client_email}")
+
+                # Enviar el registro a la cola para guardarlo en la base de datos
+                subscription_queue.put({"email": client_email, "event": event})
             else:
                 writer.write("Acción desconocida.\n".encode())
                 await writer.drain()
@@ -163,6 +205,7 @@ async def console_handler(shutdown_event):
         elif command.strip() == "exit":
             print("Saliendo del servidor...")
             shutdown_event.set()
+            # Cerrar todas las conexiones activas
             for writer in list(active_clients):
                 writer.close()
                 try:
@@ -193,8 +236,18 @@ async def main(host, port):
     await console_task
 
 if __name__ == "__main__":
+    # Iniciar el worker de suscripciones en un proceso separado
+    worker_process = multiprocessing.Process(target=subscription_worker, args=(subscription_queue,))
+    worker_process.start()
+
     parser = argparse.ArgumentParser(description="Servidor de Notificaciones en Vivo")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host del servidor")
     parser.add_argument("--port", type=int, default=8888, help="Puerto del servidor")
     args = parser.parse_args()
-    asyncio.run(main(args.host, args.port))
+
+    try:
+        asyncio.run(main(args.host, args.port))
+    finally:
+        # Parar el worker y esperar a que finalice
+        subscription_queue.put("STOP")
+        worker_process.join()
