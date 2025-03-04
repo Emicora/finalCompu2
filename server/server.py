@@ -4,6 +4,7 @@ import json
 import sqlite3
 import multiprocessing
 import time
+import socket
 from tasks import process_notification, send_email_notification  # Importamos tareas de Celery
 
 # Lista de eventos predefinidos
@@ -162,6 +163,7 @@ async def handle_client(reader, writer):
         if client_email in registered_emails:
             registered_emails.remove(client_email)
 
+
 async def console_handler(shutdown_event):
     """Lee comandos desde la consola del servidor y envía notificaciones."""
     loop = asyncio.get_event_loop()
@@ -216,9 +218,19 @@ async def console_handler(shutdown_event):
         else:
             print("Comando no reconocido. Usa 'send <evento> <mensaje>' o 'exit'.")
 
+
 async def main(host, port):
     shutdown_event = asyncio.Event()
-    server = await asyncio.start_server(handle_client, host, port)
+
+    # Crear un socket IPv6 y desactivar IPV6_V6ONLY para aceptar conexiones IPv4 también
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, port))
+    sock.listen()
+    sock.setblocking(False)
+
+    server = await asyncio.start_server(handle_client, sock=sock)
     addr = server.sockets[0].getsockname()
     print(f"Servidor corriendo en {addr}")
 
@@ -235,13 +247,14 @@ async def main(host, port):
 
     await console_task
 
+
 if __name__ == "__main__":
     # Iniciar el worker de suscripciones en un proceso separado
     worker_process = multiprocessing.Process(target=subscription_worker, args=(subscription_queue,))
     worker_process.start()
 
     parser = argparse.ArgumentParser(description="Servidor de Notificaciones en Vivo")
-    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host del servidor")
+    parser.add_argument("--host", type=str, default="::", help="Host del servidor (dual-stack: '::' para IPv6 y IPv4)")
     parser.add_argument("--port", type=int, default=8888, help="Puerto del servidor")
     args = parser.parse_args()
 
