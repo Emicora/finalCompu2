@@ -222,11 +222,17 @@ async def console_handler(shutdown_event):
 async def main(host, port):
     shutdown_event = asyncio.Event()
 
-    # Crear un socket IPv6 y desactivar IPV6_V6ONLY para aceptar conexiones IPv4 también
-    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    # Obtener la información de la dirección para host y port con AF_UNSPEC
+    addrinfo = socket.getaddrinfo(host, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+    # Usamos el primer resultado disponible
+    af, socktype, proto, canonname, sa = addrinfo[0]
+
+    sock = socket.socket(af, socktype, proto)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((host, port))
+    # Si se crea un socket IPv6, desactivar IPV6_V6ONLY para modo dual-stack
+    if af == socket.AF_INET6:
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    sock.bind(sa)
     sock.listen()
     sock.setblocking(False)
 

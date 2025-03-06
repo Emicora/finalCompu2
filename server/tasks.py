@@ -9,9 +9,9 @@ app = Celery('tasks', broker='redis://localhost:6379/0', backend='redis://localh
 # Configuración del servidor SMTP para envío de correos con Gmail
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587  # Puerto para TLS
-FROM_ADDRESS = "alaskaa2501@gmail.com"       # Cambia esto por tu correo
-SMTP_USER = "alaskaa2501@gmail.com"            # Tu usuario, generalmente tu correo
-SMTP_PASSWORD = "jbge fjhq gqzj mbtm"          # La contraseña de aplicación que generaste
+FROM_ADDRESS = "alaskaa2501@gmail.com"       
+SMTP_USER = "alaskaa2501@gmail.com"            
+SMTP_PASSWORD = "jbge fjhq gqzj mbtm"          
 
 @app.task
 def process_notification(event, message):
